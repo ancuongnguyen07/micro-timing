@@ -57,6 +57,7 @@ static const struct variant variants[] = {FOR_EACH_SQRT(VARIANT_ROW)};
 static uint64_t buf_empty[TOTAL];
 static uint64_t buf_body[TOTAL];
 static char run_stamp[32]; /* sweep start time, used in CSV rows / file names */
+static char cpu_model[128] = "unknown"; /* "model name" of CPU_ID, see below */
 
 static int cmp_u64(const void *a, const void *b) {
   uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -176,6 +177,36 @@ struct result {
   double pmc_per_region, pmc_per_unit;
 };
 
+/* Fill cpu_model with the "model name" line of /proc/cpuinfo that belongs to
+ * logical CPU `cpu` (the "processor : N" block with N == cpu). Hybrid CPUs can
+ * have different models per core, so match the pinned CPU, not just the
+ * first block. Leaves "unknown" if the file or the field is missing. */
+static void read_cpu_model(int cpu) {
+  FILE *f = fopen("/proc/cpuinfo", "r");
+  if (!f)
+    return;
+  char line[512];
+  int cur = -1;
+  while (fgets(line, sizeof line, f)) {
+    if (!strncmp(line, "processor", 9)) {
+      char *c = strchr(line, ':');
+      cur = c ? atoi(c + 1) : -1;
+    } else if (cur == cpu && !strncmp(line, "model name", 10)) {
+      char *c = strchr(line, ':');
+      if (!c)
+        break;
+      c++;
+      while (*c == ' ' || *c == '\t')
+        c++;
+      c[strcspn(c, "\r\n")] = '\0';
+      if (*c)
+        snprintf(cpu_model, sizeof cpu_model, "%s", c);
+      break;
+    }
+  }
+  fclose(f);
+}
+
 /* The one CSV file of this program run: OUT_DIR/bench_<stamp>_cpu<N>.csv.
  * Header written once; every benchmark (sibling state x fill count) appends
  * one row, so a crash or Ctrl-C keeps the rows measured so far. */
@@ -193,7 +224,7 @@ static int csv_open(void) {
     fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno));
     return -1;
   }
-  fputs("timestamp,cpu_id,sibling_cpu,sibling_state,sibling_load,sibling_cmd,"
+  fputs("timestamp,cpu_id,cpu_model,sibling_cpu,sibling_state,sibling_load,sibling_cmd,"
         "fill_entry,"
         "sqrt_delay,unroll,warmup,iterations,rdpru_sel,"
         "empty_min,empty_median,empty_mean,empty_stddev,empty_p99,empty_max,"
@@ -224,6 +255,8 @@ static int write_csv(const struct result *r) {
     return -1;
   /* identification columns */
   fprintf(f, "%s,%d,", run_stamp, CPU_ID);
+  csv_quoted(f, cpu_model);
+  fputc(',', f);
   if (r->sibling_cpu >= 0)
     fprintf(f, "%d,", r->sibling_cpu);
   else
@@ -329,6 +362,8 @@ int main(int argc, char **argv) {
   printf("pinned to CPU %d (running on logical CPU %d)\n", CPU_ID,
          sched_getcpu());
   print_topology(CPU_ID);
+  read_cpu_model(CPU_ID);
+  printf("CPU model: %s\n", cpu_model);
   printf("Running %d warmup + %d timed samples, UNROLL=%d, %zu (sqrtsd, fill) "
          "combinations per sibling state\n",
          WARMUP, SAMPLES, UNROLL, N_VARIANTS);

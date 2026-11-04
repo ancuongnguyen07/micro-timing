@@ -35,7 +35,9 @@ void sibling_stop(void);
  *     output); the command runs as the same user as bench (root under sudo).
  *   - it gets its own process group; sibling_idle()/sibling_stop() send it
  *     SIGTERM, then SIGKILL after 1 s, to the whole group. Ctrl-C/SIGTERM
- *     of bench also kills it. A command that detaches itself into another
+ *     of bench also kills it. If bench
+ *     is killed with SIGKILL or crashes, a small watchdog process notices the
+ *     closed pipe and kills the group (see sibling.c). A command that detaches itself into another
  *     process group (setsid, daemonizing) escapes this and must be stopped by hand.
  *   - it should run until stopped. If it exits earlier, a warning is printed
  *     (later samples were not measured under load).

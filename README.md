@@ -10,16 +10,24 @@ sorting, statistics, printing) is C.
 ```
 micro_bench/
 ├── Makefile
+├── run_exp.sh           build, then run bench N times (-i N, -c CMD) and check the CSVs
 ├── include/
 │   ├── bench_config.h   UNROLL, WARMUP, SAMPLES, APERF/MPERF, CPU_ID (C + asm)
 │   ├── bench.h          C prototypes of bench_empty / bench_body
 │   ├── rdpru.inc        TIMER_START / TIMER_STOP macros (lfence; rdpru; lfence)
 │   ├── body.inc         *** edit this: BODY_SETUP and BODY ***
-│   └── sibling.h        API to switch the SMT sibling idle / busy
-└── src/
-    ├── bench.S          bench_empty / bench_body, generated from one template
-    ├── main.c           pin CPU, CPUID check, qsort, median/min, printf
-    └── sibling.c        helper thread on the SMT sibling (idle / busy)
+│   └── sibling.h        API to switch the SMT sibling idle / busy, or run a -c
+│                        command on it (incl. sibling_kill_command)
+├── src/
+│   ├── bench.S          bench_empty / bench_body, generated from one template
+│   ├── main.c           pin CPU, CPUID check, qsort, median/min, printf
+│   └── sibling.c        helper thread on the SMT sibling (idle / busy); -c command
+│                        runner + watchdog that kills it if bench dies (SIGKILL)
+├── pysrc/
+│   ├── csv_checker.py   checks header and column count of every CSV in odata/
+│   └── analyzer.ipynb   plots the latest CSV (PMC counts, idle vs busy sibling)
+├── odata/               results: one bench_<timestamp>_cpu<N>.csv per bench run
+└── build/               object files and the bench binary (make; make clean removes it)
 ```
 
 ## Use
@@ -168,7 +176,88 @@ How it works (`start_command()` / `stop_command()` in `src/sibling.c`):
    returns. `sibling_idle()` and `sibling_stop()` call the same function.
    As a safety net it is also registered with `atexit()`, so any `exit()`
    kills the command too. Ctrl-C / SIGTERM / SIGHUP of `bench` also kill it
-   (signal handler), and the child is set to die with its parent.
+   (signal handler).
+5. A small **watchdog** process covers the cases where no code of `bench`
+   can run any more (SIGKILL, crash, OOM kill); see the next subsection.
+
+#### The watchdog
+
+*Why it is needed.* The explicit kill in `main()`, the `atexit()` hook and the
+signal handler are all code inside `bench`. None of them runs if `bench` is
+killed with SIGKILL (`kill -9`, the OOM killer) or crashes. The kernel offers
+only a "die with my parent" request (`PR_SET_PDEATHSIG`); it is set on the
+command's shell, but a test showed it does not stop the processes that the
+shell started. Without more, such a command would keep burning the sibling
+CPU and silently spoil every later measurement.
+
+*What it is.* A tiny extra process created by `start_watchdog()` in
+`src/sibling.c`, right after the command was started. It does nothing but
+wait on a pipe:
+
+```
+bench ---- write end of pipe ----> watchdog (blocked in read(), no CPU use)
+  |                                    |
+  +-- forks --> sh -c "CMD" (own       +-- on wake-up: maybe kill(-pgid, SIGKILL)
+                process group, pgid)
+```
+
+*Protocol.* The pipe is created after the command was forked, so the command
+and its children never inherit the write end (otherwise the pipe would never
+close). Only `bench` holds it.
+
+| What `bench` does | What the watchdog sees | What the watchdog does |
+|-------------------|------------------------|------------------------|
+| ends normally: kills the command, writes `D`, closes the pipe, `waitpid`s the watchdog | byte `D` | exits quietly, nothing killed |
+| dies by SIGKILL, crash or OOM: the kernel closes the pipe | end-of-file, no `D` | sends SIGKILL to the command's process group, then exits |
+| is stopped by SIGINT/SIGTERM/SIGHUP: handler kills the group, then `bench` dies | end-of-file, no `D` | kills the (already dead) group again, harmless, then exits |
+
+The explicit `D` byte exists so that a normal end never makes the watchdog
+kill a process group by mistake: once the command is gone, its process-group
+id could in theory be reused by an unrelated process.
+
+*Design details*
+- It runs in its own session (`setsid`) and ignores SIGINT/SIGHUP/SIGTERM, so
+  Ctrl-C or a closed terminal does not kill it before it has done its job.
+- After `fork()` it only calls async-signal-safe functions (`close`, `setsid`,
+  `signal`, `read`, `kill`, `_exit`), because `bench` has other threads.
+- It is created before the busy sweep starts, never during timed regions,
+  and it sleeps in `read()` for the whole sweep, so it does not disturb the
+  measurement.
+- If it cannot be created, `bench` kills the command again and aborts instead
+  of running it unprotected.
+- While a `-c` command runs, `ps` / `pgrep -x bench` shows **two** `bench`
+  processes: `bench` itself and the watchdog. After a normal end, none is left.
+
+*Coverage (tested)*
+
+| How `bench` ended | Command (and its children) left running? |
+|---|---|
+| normal end of the sweep | no |
+| SIGINT, SIGTERM | no |
+| `kill -9`, command with two background children | no |
+| `kill -9`, command = one plain program | no |
+| `kill -9`, command moved itself out with `setsid` | **yes** |
+
+*Limits*
+- It kills the command's **process group**. A command that leaves the group
+  (`setsid`, daemonizing, `nohup ... &` that starts a new session) is not
+  reached; stop it by hand.
+- The kill happens a few milliseconds after `bench` dies, not instantly.
+- A gap of a few microseconds remains between starting the command and
+  starting the watchdog; if `bench` is SIGKILLed exactly then, only the
+  "die with my parent" request on the shell applies.
+- The watchdog itself can be killed (e.g. by a broad `pkill bench`). Then it
+  is gone, and a later SIGKILL of `bench` is no longer covered.
+
+*Checking it yourself.* Start `bench` with a command, find the older of the two
+`bench` processes, kill it hard, and check that the command is gone:
+
+```
+sudo ./build/bench -c 'sleep 900 & sleep 900 & wait' busy &
+pgrep -x bench          # two pids: the older one is bench, the newer the watchdog
+sudo kill -9 <older pid>
+sleep 1; pgrep -x sleep # no sleep 900 left
+```
 
 Notes and limits of command mode:
 
@@ -184,16 +273,12 @@ Notes and limits of command mode:
   inside the command to keep them: `-c 'mytool > /tmp/out.log 2>&1'`.
 - The command runs with the privileges of `bench`, i.e. **as root** when
   started with `sudo` or `run_exp.sh`. Do not pass untrusted commands.
-- **Not covered: `bench` itself being killed with SIGKILL (or crashing, OOM,
-  `kill -9`).** No code runs in that case. The child only has a
-  "die with my parent" request (`PR_SET_PDEATHSIG`), which was observed not to
-  stop a command's own children: in a test, both a command with two
-  background children and a plain `sleep` command survived `kill -9 bench`.
-  After such a kill, look for the leftover process (`ps`, `pgrep`) and stop it
-  by hand. SIGINT and SIGTERM were tested and do clean up the whole group.
+- *`bench` killed with SIGKILL / crash / OOM:* handled by the watchdog (see
+  above).
 - A command that detaches itself (`setsid`, daemonizing, `nohup ... &` that
-  leaves the process group) escapes the clean-up and has to be stopped by hand
-  (tested: a `setsid` child survived a SIGTERM of `bench`).
+  leaves the process group) escapes the clean-up, including the watchdog, and
+  has to be stopped by hand (tested: a `setsid` child survived a SIGKILL of
+  `bench`).
 - The idle sweep is unchanged: `-c` only affects `busy`. With mode `idle` it is
   ignored (a note is printed), and without an SMT sibling it is ignored too.
 - The CSV column `sibling_cmd` only records the command text, not its
@@ -255,10 +340,11 @@ dropped; the statistics below use the remaining `iterations` samples.
 |--------|---------|
 | `timestamp` | Start time of the program run (`YYYYMMDD_HHMMSS`). The same for all rows of a file and part of its name. |
 | `cpu_id` | Logical CPU the benchmark thread was pinned to (`CPU_ID`). |
+| `cpu_model` | CPU model string: the `model name` field of `/proc/cpuinfo` for the pinned CPU (the `processor : <cpu_id>` block), e.g. `AMD Ryzen 7 7730U with Radeon Graphics`. Written CSV-quoted. `unknown` if it cannot be read. The same value is printed at startup. |
 | `sibling_cpu` | Logical CPU of the SMT sibling that the helper thread ran on. Blank if the CPU has no sibling. |
 | `sibling_state` | `idle`, `busy` or `none` (no sibling found). See the sibling section above. |
 | `sibling_load` | Which busy load ran: the value of `SIBLING_LOAD` (0 = `pause` loop, 1 = dependent `imul` chain, 2 = empty loop, 3 = custom code), or 4 = external command given with `-c`. Only set when `sibling_state` is `busy`; blank otherwise. For 3, the CSV only records the number, so note what your custom code does. |
-| `sibling_cmd` | The `-c` command text (CSV-quoted, so it may contain commas and quotes). Blank unless `sibling_load` is 4. Files written before this column existed lack it; `pysrc/csv_checker.py` accepts both layouts. |
+| `sibling_cmd` | The `-c` command text (CSV-quoted, so it may contain commas and quotes). Blank unless `sibling_load` is 4. |
 | `fill_entry` | Number of dependent `imulq $5, %r8` instructions per `UNROLL` repetition in `BODY` (the "fill" count of this variant, from `FOR_EACH_FILL`). The timed region contains `unroll x fill_entry` of them. |
 | `sqrt_delay` | Number of dependent `sqrtsd` in `BODY_SETUP` (from `FOR_EACH_SQRT`). They run outside the timed region but delay `%r8`, and so the start of the `imulq` chain. |
 | `unroll` | `UNROLL`: how many times `BODY` is repeated inside one timed region. |

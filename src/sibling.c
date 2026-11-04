@@ -213,6 +213,61 @@ static void ms_sleep(int ms) {
   nanosleep(&ts, NULL);
 }
 
+/* ---- watchdog: also kill the command when bench dies without cleaning up ----
+ * Signal handlers and atexit() do not run on SIGKILL / crash / OOM kill. So a
+ * tiny separate process (the watchdog) blocks on a pipe whose write end only
+ * bench holds. When bench ends normally it writes 'D' ("done") before closing
+ * the pipe and the watchdog exits quietly. If the pipe closes WITHOUT 'D',
+ * bench vanished: the watchdog SIGKILLs the command's process group.
+ * The pipe is created after the command was forked, so the command never
+ * inherits the write end (that would keep the pipe open forever). */
+static pid_t wd_pid = -1; /* watchdog process, -1 = none */
+static int wd_fd = -1;    /* bench's write end of the pipe */
+
+static int start_watchdog(pid_t pgid) {
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0)
+    return -1;
+  pid_t w = fork();
+  if (w < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  if (w == 0) {
+    /* watchdog: only async-signal-safe calls (bench has other threads) */
+    close(fds[1]);
+    setsid(); /* survive terminal hangup / Ctrl-C aimed at bench */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    char c = 0;
+    ssize_t n;
+    do {
+      n = read(fds[0], &c, 1);
+    } while (n < 0 && errno == EINTR);
+    if (n != 1 || c != 'D')
+      kill(-pgid, SIGKILL); /* EOF without 'D': bench is gone */
+    _exit(0);
+  }
+  close(fds[0]);
+  wd_pid = w;
+  wd_fd = fds[1];
+  return 0;
+}
+
+/* Normal end: tell the watchdog it is not needed, and reap it. */
+static void dismiss_watchdog(void) {
+  if (wd_pid <= 0)
+    return;
+  ssize_t r = write(wd_fd, "D", 1);
+  (void)r;
+  close(wd_fd);
+  wd_fd = -1;
+  waitpid(wd_pid, NULL, 0);
+  wd_pid = -1;
+}
+
 /* Start `cmd` as a process confined to the sibling CPU. 0 = running. */
 static int start_command(void) {
   fflush(NULL); /* do not duplicate buffered output in the child */
@@ -248,12 +303,22 @@ static int start_command(void) {
   cmd_pid = p;
   install_signal_cleanup();
   atexit(sibling_kill_command); /* safety net: any exit() also kills it */
+  if (start_watchdog(p) != 0) {
+    /* without the watchdog a SIGKILL of bench would leak the command */
+    fprintf(stderr, "sibling: cannot start the watchdog: %s\n",
+            strerror(errno));
+    kill(-p, SIGKILL);
+    waitpid(p, NULL, 0);
+    cmd_pid = -1;
+    return -1;
+  }
 
   ms_sleep(SIBLING_CMD_SETTLE_MS);
   int st;
   if (waitpid(p, &st, WNOHANG) == p) {
     cmd_pid = -1;
     kill(-p, SIGKILL); /* anything it left behind */
+    dismiss_watchdog();
     if (WIFEXITED(st) && WEXITSTATUS(st) == 126)
       fprintf(stderr, "sibling: could not pin the command to CPU %d\n",
               sib_cpu);
@@ -294,6 +359,7 @@ static void stop_command(void) {
   }
   kill(-p, SIGKILL); /* stragglers in the group; ESRCH if none */
   cmd_pid = -1;
+  dismiss_watchdog(); /* the command is gone: watchdog no longer needed */
 }
 
 void sibling_kill_command(void) { stop_command(); }
