@@ -88,6 +88,10 @@ benchmark leaves the busy state. Which version of it is compiled is decided by
 | `SIBLING_LOAD_IMUL` (default) | 1 | a dependent `imul` chain. Occupies the multiplier and its scheduler queue |
 | `SIBLING_LOAD_EMPTY` | 2 | an empty loop: only a counter decrement + branch, no real work and no `pause`. The sibling issues at full speed |
 | `SIBLING_LOAD_CUSTOM` | 3 | your own code, in the marked `SIBLING_LOAD_CUSTOM` branch of `busy_chunk()` |
+| `SIBLING_LOAD_COMMAND` | 4 | an external command given at run time with `bench -c CMD`; not a compile-time choice, so you never set `SIBLING_LOAD` to it. `busy_chunk()` is not used in this case, and the helper thread stays parked. See "Running your own command on the sibling" below. The value 4 is what lands in the CSV `sibling_load` column, together with the command text in `sibling_cmd` |
+
+Values 0-3 are what `SIBLING_LOAD` can be set to. The `sibling_load` CSV column
+can hold any of 0-4, so it tells you which kind of busy load produced a row.
 
 To change the workload, either:
 
@@ -157,9 +161,14 @@ How it works (`start_command()` / `stop_command()` in `src/sibling.c`):
    If the command has already exited by then, `bench` aborts with a message.
 3. The busy sweep runs. The CSV records `sibling_load = 4` and the command in
    the `sibling_cmd` column (quoted).
-4. At the end (`sibling_idle()` / `sibling_stop()`), the command's process
-   group gets SIGTERM, then SIGKILL after 1 s. Ctrl-C / SIGTERM / SIGHUP of
-   `bench` also kill it, and the child is set to die with its parent.
+4. Before the benchmark ends, `main()` explicitly calls
+   `sibling_kill_command()` (on the normal path and on the abort path after a
+   failed start). It sends SIGTERM to the command's whole process group,
+   SIGKILL after 1 s, and reaps it, so the command is gone before `bench`
+   returns. `sibling_idle()` and `sibling_stop()` call the same function.
+   As a safety net it is also registered with `atexit()`, so any `exit()`
+   kills the command too. Ctrl-C / SIGTERM / SIGHUP of `bench` also kill it
+   (signal handler), and the child is set to die with its parent.
 
 Notes and limits of command mode:
 
@@ -175,8 +184,16 @@ Notes and limits of command mode:
   inside the command to keep them: `-c 'mytool > /tmp/out.log 2>&1'`.
 - The command runs with the privileges of `bench`, i.e. **as root** when
   started with `sudo` or `run_exp.sh`. Do not pass untrusted commands.
+- **Not covered: `bench` itself being killed with SIGKILL (or crashing, OOM,
+  `kill -9`).** No code runs in that case. The child only has a
+  "die with my parent" request (`PR_SET_PDEATHSIG`), which was observed not to
+  stop a command's own children: in a test, both a command with two
+  background children and a plain `sleep` command survived `kill -9 bench`.
+  After such a kill, look for the leftover process (`ps`, `pgrep`) and stop it
+  by hand. SIGINT and SIGTERM were tested and do clean up the whole group.
 - A command that detaches itself (`setsid`, daemonizing, `nohup ... &` that
-  leaves the process group) escapes the clean-up and has to be stopped by hand.
+  leaves the process group) escapes the clean-up and has to be stopped by hand
+  (tested: a `setsid` child survived a SIGTERM of `bench`).
 - The idle sweep is unchanged: `-c` only affects `busy`. With mode `idle` it is
   ignored (a note is printed), and without an SMT sibling it is ignored too.
 - The CSV column `sibling_cmd` only records the command text, not its
