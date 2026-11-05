@@ -5,18 +5,18 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "bench_config.h"
 #include "sibling.h"
 
-enum { ST_IDLE, ST_BUSY, ST_QUIT };
+enum { ST_IDLE, ST_BUSY, ST_QUIT, ST_ALT };
 
 static pthread_t thr;
 static int started;
@@ -30,8 +30,8 @@ static int parked;                 /* worker blocked in cond_wait (under mu) */
 static atomic_int spinning;        /* worker is inside its busy loop */
 
 /* ---- command mode (see sibling.h) ---- */
-static const char *cmd;                 /* NULL = built-in busy_chunk() */
-static volatile pid_t cmd_pid = -1;     /* process group leader, -1 = none */
+static const char *cmd;             /* NULL = built-in busy_chunk() */
+static volatile pid_t cmd_pid = -1; /* process group leader, -1 = none */
 
 void sibling_set_command(const char *c) { cmd = (c && *c) ? c : NULL; }
 const char *sibling_get_command(void) { return cmd; }
@@ -62,6 +62,7 @@ static int find_sibling(int cpu) {
   char path[128], buf[256];
   snprintf(path, sizeof path,
            "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+
   FILE *f = fopen(path, "r");
   if (!f)
     return -1;
@@ -70,6 +71,7 @@ static int find_sibling(int cpu) {
     return -1;
   }
   fclose(f);
+
   for (char *p = buf; *p;) {
     char *end;
     long lo = strtol(p, &end, 10);
@@ -148,6 +150,53 @@ static void busy_chunk(void) {
 #endif
 }
 
+/* ---- alternating mode: imul segment, nop segment, imul segment, ... ---- */
+static volatile uint32_t *alt_seg_id; /* where the current segment id goes */
+static atomic_int alt_armed;          /* calibrated, waiting for alt_go */
+static atomic_int alt_go;
+
+static uint64_t rdpru_now(void) {
+  uint32_t lo, hi;
+  __asm__ volatile("lfence\n\tmov %2, %%ecx\n\trdpru\n\tlfence"
+                   : "=a"(lo), "=d"(hi)
+                   : "i"(RDPRU_SEL)
+                   : "ecx", "memory");
+  return ((uint64_t)hi << 32) | lo;
+}
+
+/* Loop count that makes fn run for about TS_SEG_TICKS (RDPRU ticks). */
+static uint64_t calibrate(void (*fn)(uint64_t)) {
+  const uint64_t n = 2000;
+  uint64_t best = UINT64_MAX;
+  fn(n); /* warm up */
+  for (int i = 0; i < 5; i++) {
+    uint64_t t0 = rdpru_now();
+    fn(n);
+    uint64_t dt = rdpru_now() - t0;
+    if (dt < best)
+      best = dt;
+  }
+  uint64_t iters = best ? (uint64_t)TS_SEG_TICKS * n / best : 1;
+  return iters ? iters : 1;
+}
+
+static void alt_run(void) {
+  void (*const kernel[2])(uint64_t) = {sib_imul, sib_nop};
+  uint64_t iters[2] = {calibrate(sib_imul), calibrate(sib_nop)};
+  atomic_store(&alt_armed, 1);
+  while (!atomic_load(&alt_go) &&
+         atomic_load_explicit(&state, memory_order_relaxed) == ST_ALT)
+    __builtin_ia32_pause();
+  for (uint32_t id = 1;
+       atomic_load_explicit(&state, memory_order_relaxed) == ST_ALT; id++) {
+    int k = (id - 1) & 1; /* odd ids -> imul, even -> nop */
+    __atomic_store_n(alt_seg_id, id, __ATOMIC_RELEASE);
+    kernel[k](iters[k]);
+  }
+  atomic_store(&alt_armed, 0);
+  atomic_store(&alt_go, 0);
+}
+
 static void *worker(void *arg) {
   (void)arg; /* already pinned to sib_cpu by the attribute in sibling_start */
   pthread_mutex_lock(&mu);
@@ -162,8 +211,11 @@ static void *worker(void *arg) {
       break;
     pthread_mutex_unlock(&mu);
     atomic_store(&spinning, 1);
-    while (atomic_load_explicit(&state, memory_order_relaxed) == ST_BUSY)
-      busy_chunk();
+    if (atomic_load(&state) == ST_ALT)
+      alt_run();
+    else
+      while (atomic_load_explicit(&state, memory_order_relaxed) == ST_BUSY)
+        busy_chunk();
     atomic_store(&spinning, 0);
     pthread_mutex_lock(&mu);
   }
@@ -191,11 +243,13 @@ int sibling_start(int cpu) {
   CPU_ZERO(&set);
   CPU_SET(sib_cpu, &set);
   pthread_attr_t attr;
+
   int err = pthread_attr_init(&attr);
   if (!err)
     err = pthread_attr_setaffinity_np(&attr, sizeof set, &set);
   if (!err)
     err = pthread_create(&thr, &attr, worker, NULL);
+
   pthread_attr_destroy(&attr);
   if (err) {
     fprintf(stderr, "sibling: cannot start helper pinned to CPU %d: %s\n",
@@ -395,6 +449,23 @@ int sibling_busy(void) {
   usleep(2000); /* let it reach steady state (clocks, uop cache) */
   return 0;
 }
+
+int sibling_alt_start(volatile uint32_t *seg_id) {
+  if (!started)
+    return -1;
+  alt_seg_id = seg_id;
+  atomic_store(&alt_armed, 0);
+  atomic_store(&alt_go, 0);
+  pthread_mutex_lock(&mu);
+  atomic_store(&state, ST_ALT);
+  pthread_cond_broadcast(&cv_wake);
+  pthread_mutex_unlock(&mu);
+  while (!atomic_load(&alt_armed))
+    sched_yield();
+  return 0;
+}
+
+void sibling_alt_go(void) { atomic_store(&alt_go, 1); }
 
 void sibling_stop(void) {
   if (!started)

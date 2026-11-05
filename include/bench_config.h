@@ -14,8 +14,9 @@
 
 /* Timed regions measured and kept / thrown away (cold caches, branch
  * predictors, frequency ramp-up). Total samples = WARMUP + SAMPLES. */
-#define WARMUP      10
 #define SAMPLES     100001            /* odd, so the median is one real sample */
+#define WARMUP ((SAMPLES - 1) / 100) /* throw away the first 1% of samples */
+
 
 /* Which RDPRU register to read (value goes in %ecx):
  *   0 = MPERF : ticks at a FIXED reference rate (like the TSC)
@@ -54,6 +55,27 @@
 #define FOR_EACH_FILL(X, S)                                                   \
   X(S,14) X(S, 15) X(S, 16) X(S, 17) X(S, 18) X(S, 19) X(S, 20) X(S, 21) X(S, 22) X(S, 23)     \
   X(S, 24) X(S, 25) X(S, 26)
+
+/* ======================================================================
+ * TIME-SERIES MODE  (./build/bench -t)  -  RDPRU only, no PMC
+ *
+ * The measurement thread times the BODY probe back to back until TS_SAMPLES
+ * samples are collected (or TS_WINDOW_TICKS RDPRU ticks passed) while the SMT sibling alternates, segment by
+ * segment, between a block of imul (include/sib_imul.inc) and a block of nop
+ * (include/sib_nop.inc). Output: odata/ts/bench_<stamp>_cpu<N>_timeseries.csv with one row
+ * per probe: (timestamp, latency, seg_id, sibling).
+ * ====================================================================== */
+#define TS_SAMPLES      437365 /* samples to collect (the run ends when reached) */
+#define TS_MAX_SAMPLES  TS_SAMPLES /* capacity of the sample buffer (24 B each) */
+#define TS_WINDOW_TICKS (1ULL << 40) /* safety cap on the duration (RDPRU
+                                  ticks); normally TS_SAMPLES ends the run first */
+#define TS_SEG_TICKS    1200000000 /* target length of one sibling segment (RDPRU
+                                  ticks); the sibling calibrates its loop counts
+                                  to it. Every sample costs ~18000 ticks (BODY_SETUP
+                                  runs per sample), so 1.2e9 ticks = ~65000
+                                  samples per phase: long, clearly separated
+                                  imul / nop phases (a square wave) */
+#define TS_SIB_FILL     15     /* instructions per sibling block (imul / nop) */
 
 /* Hardware performance counter to read around each bench_* call (raw perf
  * config = event | umask << 8, AMD Zen 3 "dispatch token stalls 2", PMCx0AF):

@@ -16,13 +16,20 @@ micro_bench/
 │   ├── bench.h          C prototypes of bench_empty / bench_body
 │   ├── rdpru.inc        TIMER_START / TIMER_STOP macros (lfence; rdpru; lfence)
 │   ├── body.inc         *** edit this: BODY_SETUP and BODY ***
-│   └── sibling.h        API to switch the SMT sibling idle / busy, or run a -c
-│                        command on it (incl. sibling_kill_command)
+│   ├── sibling.h        API to switch the SMT sibling idle / busy, or run a -c
+│   │                    command on it (incl. sibling_kill_command), or alternate
+│   │                    two code blocks (time-series mode)
+│   ├── sib_imul.inc     sibling block #1 for -t: a chain of dependent imul
+│   ├── sib_nop.inc      sibling block #2 for -t: a run of nop
+│   └── utils.h          result types + CSV writers (sweep and time series)
 ├── src/
 │   ├── bench.S          bench_empty / bench_body, generated from one template
+│   ├── timeseries.S     -t: back-to-back RDPRU probes, tagged with the sibling segment
+│   ├── sib_kernels.S    -t: sib_imul() / sib_nop(), run on the sibling
+│   ├── utils.c          CSV output (sweep rows and time-series files)
 │   ├── main.c           pin CPU, CPUID check, qsort, median/min, printf
-│   └── sibling.c        helper thread on the SMT sibling (idle / busy); -c command
-│                        runner + watchdog that kills it if bench dies (SIGKILL)
+│   └── sibling.c        helper thread on the SMT sibling (idle / busy / alternating);
+│                        -c command runner + watchdog that kills it if bench dies (SIGKILL)
 ├── pysrc/
 │   ├── csv_checker.py   checks header and column count of every CSV in odata/
 │   └── analyzer.ipynb   plots the latest CSV (PMC counts, idle vs busy sibling)
@@ -320,6 +327,78 @@ Notes and limits of command mode:
   as some other guest.
 - *Not covered:* the helper does not control the frequency governor, other
   physical cores, or shared L3 / memory traffic.
+
+## Time-series mode (`-t`)
+
+```
+./build/bench -t          # or: ./run_exp.sh -t   (no sudo: RDPRU only, no PMC)
+```
+
+The measurement thread times the `BODY` probe back to back until `TS_SAMPLES`
+samples are collected. Meanwhile the SMT sibling alternates, segment by
+segment, between a block of dependent `imul` (`include/sib_imul.inc`) and a
+block of `nop` (`include/sib_nop.inc`). Before each segment the sibling
+publishes a segment id (odd = imul, even = nop, 0 = not started yet); the probe
+loop tags every sample with it. Result: a square wave, latency high while the
+sibling runs imul and low while it runs nop.
+
+Output: `odata/ts/bench_<stamp>_cpu<N>_timeseries*.csv` (a subfolder, so
+`csv_checker.py` ignores it), one row per probe:
+`timestamp,latency,seg_id,sibling`. `timestamp` is ticks since the window
+start; `latency` is the elapsed ticks of the timed probe.
+Tunables are in `bench_config.h` (`TS_SAMPLES`, `TS_SEG_TICKS`, `TS_SIB_FILL`).
+
+### Root cause: why `BODY_SETUP` must run before every sample
+
+The first version ran `BODY_SETUP` (the 10000-iteration drain loop plus the
+dependent `sqrtsd` chain) **once** before the measured window. The probe then
+showed almost no sibling effect: median 44 ticks while the sibling ran imul
+against 37 while it ran nop. Running `BODY_SETUP` before **every** sample, as
+`bench.S` does, gives 119 against 38 ticks, a clean square wave.
+
+| `BODY_SETUP`            | segment length    | imul phase | nop phase |
+|-------------------------|-------------------|-----------:|----------:|
+| once, before the window | 50 000 ticks      | 44         | 37        |
+| before every sample     | 50 000 ticks      | 119        | 38        |
+| before every sample     | 100 000 000 ticks | 118        | 38        |
+
+(median latency in ticks; sibling block = 15 instructions, probe `fill` = 18,
+`sqrtsd` = 3). The segment length is not what produces the contrast: with the
+short segments the contrast is already there, only the phases are too short to
+see on a long axis.
+
+*Likely mechanism, not isolated by an experiment.* `sqrtsd` is slow and
+`BODY_SETUP` makes `%r8` depend on it, so the `imulq` chain of `BODY` is
+dispatched into the integer scheduler queue long before its input is ready and
+sits there waiting. When the sibling also runs a dependent `imul` chain it
+competes for the same queue entries; a full queue stalls dispatch, and that
+delays the closing `rdpru`. With the setup run only once, the first `BODY` is
+the only one delayed by `sqrtsd` and the queue is never kept under pressure.
+This matches the scheduler-queue measurements in `pysrc/analyzer.ipynb` (PMC
+`IntSch1TokenStall` in the sweep) but was not checked with the PMC in `-t` mode.
+
+Consequences:
+
+- A sample now costs about 18 000 ticks (the drain loop dominates), not about
+  70. `TS_SEG_TICKS` is in **ticks**, so size it for the sample cost:
+  `1.2e9` ticks gives about 65 000 samples per phase, and a 437 365-sample run
+  takes about 2 s. With the old per-sample cost a 100 000 000-tick segment
+  would not even end within the run.
+- Segment lengths are approximate: the sibling calibrates its loop counts
+  before the run, and conditions during the run differ. Use each sample's
+  `seg_id`, not the nominal length, to find the segment edges.
+
+### Known artifact: negative latencies
+
+A few samples (about 20 of 437 365) have a negative elapsed time, stored as an
+unsigned wrap (`2^64 - x`, e.g. 18446744073709551609). Cause: `RDPRU_READ`
+(`include/rdpru.inc`) has **no `lfence`**, although its header comment calls
+for one, so the two `rdpru` reads of a probe can execute out of order. Adding
+`lfence` before and after each read removed all negative samples in 3 runs
+(0 against 14 to 29 per run without), but also raised the probe latency from
+37 to about 116 ticks because the fences and `rdpru` are then part of the
+timed region. They cluster in the first samples after a sibling segment
+switch. `analyzer.ipynb` reads the column as signed and drops them.
 
 ## CSV output
 

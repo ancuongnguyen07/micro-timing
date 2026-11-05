@@ -18,6 +18,7 @@ EXPECTED_HEADER = (
 EXPECTED_NUM_COLUMNS = len(EXPECTED_HEADER.split(","))
 
 if __name__ == "__main__":
+    print("CSV CHECKER running...")
     csv_file_ls = [f for f in os.listdir(CSV_DIR) if f.endswith(".csv")]
     if not csv_file_ls:
         raise FileNotFoundError(f"No CSV files found in {CSV_DIR}")

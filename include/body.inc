@@ -47,42 +47,8 @@
     .macro BODY fill=FILL_ENTRY
     .rept UNROLL
         .rept \fill
-            imulq $5, %r8
+            imulq $5, %r8 /* change the instruction later for different target ALU */
         .endr
     .endr
     .endm # BODY
 
-/* ---- example 1 (active): LATENCY of 64-bit imul  (Zen 3: expect ~3.00)
-    .macro BODY
-    .rept UNROLL
-    imul    %rsi, %rsi              # rsi = rsi * rsi : depends on previous rsi
-    .endr
-    .endm
-*/
-
-/* ---- example 2: THROUGHPUT of imul (independent dest regs) --------------
- *    .macro BODY
- *    .rept UNROLL / 4
- *    imul    %rsi, %rbx
- *    imul    %rsi, %rdi
- *    imul    %rsi, %r8
- *    imul    %rsi, %r9
- *    .endr
- *    .endm
- *   (then divide by UNROLL, as before)
- *
- * ---- example 3: LATENCY of a load (pointer chase, L1 hit: ~4-5) ---------
- *    BODY_SETUP:  lea  slot(%rip), %rsi ; mov %rsi, (%rsi)  # slot -> slot
- *    BODY:        mov  (%rsi), %rsi
- *   (declare `slot: .quad 0` in .data)
- *
- * ---- example 4: a block of different instructions, one dependency chain -
- *    .macro BODY
- *    .rept UNROLL
- *    add     %rsi, %rdi
- *    xor     %rdi, %rsi
- *    rol     $7, %rsi
- *    .endr
- *    .endm
- *   (reports cycles per BLOCK of 3 instructions, not per instruction)
- */

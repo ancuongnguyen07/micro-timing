@@ -12,6 +12,8 @@
 #ifndef SIBLING_H
 #define SIBLING_H
 
+#include <stdint.h>
+
 #define SIBLING_NONE  (-1) /* `cpu` has no SMT sibling (SMT off / no sysfs) */
 #define SIBLING_ERROR (-2) /* sibling exists but the helper could not be
                               started or pinned to it (reason on stderr) */
@@ -25,6 +27,22 @@ void sibling_idle(void);
  * possible in command mode: fork failed, or the command exited right away). */
 int  sibling_busy(void);
 void sibling_stop(void);
+
+/* ALTERNATING MODE (time-series, `bench -t`). Instead of one fixed load, the
+ * helper thread runs segment after segment, alternating the two kernels of
+ * src/sib_kernels.S (imul block, nop block; include/sib_*.inc). Segment ids
+ * are 1, 2, 3, ...: odd = imul, even = nop. Before each segment the helper
+ * stores its id to *seg_id, so the measurement thread can tag its samples.
+ * Segment lengths are calibrated to about TS_SEG_TICKS (bench_config.h).
+ *   sibling_alt_start : switch the helper to alternating mode and calibrate;
+ *                       returns once it is armed (waiting for _go)
+ *   sibling_alt_go    : release the first segment
+ *   sibling_idle()    : ends the schedule, helper parks again
+ * Call after sibling_start(). Returns 0 on success, -1 if there is no helper. */
+void sib_imul(uint64_t iters);
+void sib_nop(uint64_t iters);
+int  sibling_alt_start(volatile uint32_t *seg_id);
+void sibling_alt_go(void);
 
 /* COMMAND MODE. Instead of the built-in busy_chunk() workload, "busy" runs
  *   /bin/sh -c "<cmd>"

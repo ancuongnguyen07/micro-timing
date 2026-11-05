@@ -1,4 +1,5 @@
 /* src/main.c  -  driver: pin, check RDPRU, calibrate, measure, report, CSV
+ * (src/utils.c)
  *
  * Only the timed loops live in assembly (src/bench.S + include/body.inc).
  *
@@ -20,6 +21,7 @@
 #include <linux/perf_event.h>
 #include <math.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,11 +34,12 @@
 #include "bench.h"
 #include "bench_config.h"
 #include "sibling.h"
+#include "utils.h"
 
 #define bit_RDPRU (1u << 4) /* 0x10 */
 #define TOTAL (WARMUP + SAMPLES)
-#define OUT_DIR "odata" /* CSV files go here (relative to the cwd) */
 
+#define ERROR_CODE -1
 #define PRINT_SEP                                                              \
   printf("------------------------------------------------------------\n")
 
@@ -58,6 +61,9 @@ static uint64_t buf_empty[TOTAL];
 static uint64_t buf_body[TOTAL];
 static char run_stamp[32]; /* sweep start time, used in CSV rows / file names */
 static char cpu_model[128] = "unknown"; /* "model name" of CPU_ID, see below */
+static bool latency_only = false; /* -l: RDPRU timing only, no PMC counter */
+static bool time_series = false;  /* -t: alternating-sibling time series */
+static struct ts_sample ts_buf[TS_MAX_SAMPLES];
 
 static int cmp_u64(const void *a, const void *b) {
   uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -87,13 +93,14 @@ static int pmc_open(void) {
 static int run_counted(int fd, bench_fn fn, uint64_t *buf, uint64_t *count) {
   if (fd < 0) {
     fn(buf, TOTAL);
-    return -1;
+    return ERROR_CODE;
   }
   ioctl(fd, PERF_EVENT_IOC_RESET, 0);
   ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
   fn(buf, TOTAL);
   ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-  return read(fd, count, sizeof *count) == (ssize_t)sizeof *count ? 0 : -1;
+  return read(fd, count, sizeof *count) == (ssize_t)sizeof *count ? 0
+                                                                  : ERROR_CODE;
 }
 
 /* Drop warm-up samples, sort the rest; returns the sorted SAMPLES-array. */
@@ -101,13 +108,6 @@ static uint64_t *sorted(uint64_t *buf) {
   qsort(buf + WARMUP, SAMPLES, sizeof buf[0], cmp_u64);
   return buf + WARMUP;
 }
-
-/* Summary of the SAMPLES kept timer values (ticks). */
-struct stats {
-  uint64_t min, median, p99, max;
-  double mean;
-  double stddev;
-};
 
 static struct stats stats_of(uint64_t *buf) {
   uint64_t *s = sorted(buf);
@@ -139,10 +139,10 @@ static int read_topology(int cpu, const char *name, char *out, size_t n) {
            name);
   FILE *f = fopen(path, "r");
   if (!f)
-    return -1;
+    return ERROR_CODE;
   if (!fgets(out, (int)n, f)) {
     fclose(f);
-    return -1;
+    return ERROR_CODE;
   }
   fclose(f);
   out[strcspn(out, "\n")] = '\0';
@@ -163,19 +163,6 @@ static void print_topology(int cpu) {
   printf("logical CPU %d -> package %s, physical core %s, SMT siblings {%s}\n",
          cpu, pkg, core, sib);
 }
-
-/* Everything one benchmark run measured (one CSV row). */
-struct result {
-  int sibling_cpu;           /* -1 = none */
-  const char *sibling_state; /* "idle" | "busy" | "none" */
-  int sqrt_delay, fill;
-  struct stats empty, body;
-  uint64_t net;    /* median(body) - median(empty), clamped at 0 */
-  double per_unit; /* net / UNROLL */
-  int pmc_ok;      /* PMC columns valid? */
-  uint64_t pmc_empty, pmc_body, pmc_net;
-  double pmc_per_region, pmc_per_unit;
-};
 
 /* Fill cpu_model with the "model name" line of /proc/cpuinfo that belongs to
  * logical CPU `cpu` (the "processor : N" block with N == cpu). Hybrid CPUs can
@@ -207,90 +194,6 @@ static void read_cpu_model(int cpu) {
   fclose(f);
 }
 
-/* The one CSV file of this program run: OUT_DIR/bench_<stamp>_cpu<N>.csv.
- * Header written once; every benchmark (sibling state x fill count) appends
- * one row, so a crash or Ctrl-C keeps the rows measured so far. */
-static FILE *csv_file;
-
-static int csv_open(void) {
-  if (mkdir(OUT_DIR, 0777) != 0 && errno != EEXIST) {
-    fprintf(stderr, "cannot create %s: %s\n", OUT_DIR, strerror(errno));
-    return -1;
-  }
-  char path[256];
-  snprintf(path, sizeof path, OUT_DIR "/bench_%s_cpu%d.csv", run_stamp, CPU_ID);
-  csv_file = fopen(path, "w");
-  if (!csv_file) {
-    fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno));
-    return -1;
-  }
-  fputs("timestamp,cpu_id,cpu_model,sibling_cpu,sibling_state,sibling_load,sibling_cmd,"
-        "fill_entry,"
-        "sqrt_delay,unroll,warmup,iterations,rdpru_sel,"
-        "empty_min,empty_median,empty_mean,empty_stddev,empty_p99,empty_max,"
-        "body_min,body_median,body_mean,body_stddev,body_p99,body_max,"
-        "net_median_ticks,net_ticks_per_unroll,"
-        "pmc_event,pmc_regions,pmc_empty_total,pmc_body_total,pmc_net_total,"
-        "pmc_net_per_region,pmc_net_per_unroll\n",
-        csv_file);
-  printf("writing results to %s\n", path);
-  return 0;
-}
-
-/* Write s as one CSV field, quoted because commands contain spaces/commas. */
-static void csv_quoted(FILE *f, const char *s) {
-  fputc('"', f);
-  for (; *s; s++) {
-    if (*s == '"')
-      fputc('"', f);
-    fputc(*s, f);
-  }
-  fputc('"', f);
-}
-
-/* Append one row (one benchmark). Returns 0 on success. */
-static int write_csv(const struct result *r) {
-  FILE *f = csv_file;
-  if (!f)
-    return -1;
-  /* identification columns */
-  fprintf(f, "%s,%d,", run_stamp, CPU_ID);
-  csv_quoted(f, cpu_model);
-  fputc(',', f);
-  if (r->sibling_cpu >= 0)
-    fprintf(f, "%d,", r->sibling_cpu);
-  else
-    fputs(",", f);
-  fprintf(f, "%s,", r->sibling_state);
-  const char *cmd = sibling_get_command();
-  if (!strcmp(r->sibling_state, "busy") && cmd) {
-    fprintf(f, "%d,", SIBLING_LOAD_COMMAND);
-    csv_quoted(f, cmd);
-    fputc(',', f);
-  } else if (!strcmp(r->sibling_state, "busy")) {
-    fprintf(f, "%d,,", SIBLING_LOAD);
-  } else {
-    fputs(",,", f);
-  }
-  fprintf(f, "%d,%d,%d,%d,%d,%d,", r->fill, r->sqrt_delay, UNROLL, WARMUP,
-          SAMPLES, RDPRU_SEL);
-  /* timer statistics (ticks) */
-  fprintf(f, "%lu,%lu,%.4f,%.4f,%lu,%lu,", r->empty.min, r->empty.median,
-          r->empty.mean, r->empty.stddev, r->empty.p99, r->empty.max);
-  fprintf(f, "%lu,%lu,%.4f,%.4f,%lu,%lu,", r->body.min, r->body.median,
-          r->body.mean, r->body.stddev, r->body.p99, r->body.max);
-  fprintf(f, "%lu,%.4f,", r->net, r->per_unit);
-  /* PMC (blank when the counter was unavailable) */
-  fprintf(f, "%s,", PMC_NAME);
-  if (r->pmc_ok)
-    fprintf(f, "%d,%lu,%lu,%lu,%.4f,%.4f\n", TOTAL, r->pmc_empty, r->pmc_body,
-            r->pmc_net, r->pmc_per_region, r->pmc_per_unit);
-  else
-    fputs(",,,,,\n", f);
-  fflush(f);
-  return 0;
-}
-
 /* One benchmark: empty region, body variant, report + CSV. */
 static void run_once(int pmc_fd, int sib_cpu, const char *state,
                      const struct variant *v) {
@@ -305,10 +208,18 @@ static void run_once(int pmc_fd, int sib_cpu, const char *state,
 
   /* 3a. calibrate: empty timed region */
   int ok_empty = run_counted(pmc_fd, v->empty, buf_empty, &pmc_empty);
+  if (!latency_only && ok_empty == ERROR_CODE) {
+    fprintf(stderr, "Warning: PMC counter not available or read failed. "
+                    "Continuing with timing only.\n");
+  }
   r.empty = stats_of(buf_empty);
 
   /* 3b. the code under test */
   int ok_body = run_counted(pmc_fd, v->body, buf_body, &pmc_body);
+  if (!latency_only && ok_body == ERROR_CODE) {
+    fprintf(stderr, "Warning: PMC counter not available or read failed. "
+                    "Continuing with timing only.\n");
+  }
   r.body = stats_of(buf_body);
 
   /* 4. net, clamped at 0 */
@@ -340,7 +251,7 @@ static void run_once(int pmc_fd, int sib_cpu, const char *state,
     printf("%s per UNROLL (%d) unit : %.4f\n", PMC_NAME, UNROLL,
            r.pmc_per_unit);
   }
-  write_csv(&r);
+  csv_write(&r);
   PRINT_SEP;
 }
 
@@ -348,6 +259,53 @@ static void run_once(int pmc_fd, int sib_cpu, const char *state,
 static void sweep(int pmc_fd, int sib_cpu, const char *state) {
   for (size_t i = 0; i < N_VARIANTS; i++)
     run_once(pmc_fd, sib_cpu, state, &variants[i]);
+}
+
+/* -t: measure the probe back to back until TS_SAMPLES samples while the sibling
+ * alternates imul / nop segments; write (timestamp, latency, ...) to a CSV. */
+static int run_timeseries(void) {
+  static volatile uint32_t seg_id; /* written by the sibling, read by the asm */
+  int sib = sibling_start(CPU_ID);
+  if (sib < 0) {
+    fprintf(stderr, "time-series mode needs a controllable SMT sibling of "
+                    "CPU %d\n", CPU_ID);
+    return 1;
+  }
+  /* touch the buffer now: page faults must not land inside the window */
+  memset(ts_buf, 0, sizeof ts_buf);
+  printf("=== time series: %d samples, sibling CPU %d alternating imul/nop "
+         "(fill %d, segment ~%d ticks) ===\n",
+         TS_SAMPLES, sib, TS_SIB_FILL, TS_SEG_TICKS);
+  if (sibling_alt_start(&seg_id) != 0) {
+    sibling_stop();
+    return 1;
+  }
+  sibling_alt_go();
+  uint64_t n = bench_timeseries(ts_buf, TS_MAX_SAMPLES, TS_WINDOW_TICKS, &seg_id);
+  sibling_idle();
+  sibling_stop();
+  if (n < TS_SAMPLES)
+    fprintf(stderr, "warning: only %lu of %d samples before the TS_WINDOW_TICKS "
+                    "cap\n", n, TS_SAMPLES);
+
+  /* quick summary: median latency per sibling activity (the mean is spoiled
+   * by rare outliers: interrupts, and RDPRU reads that go backwards) */
+  static uint64_t tmp[TS_MAX_SAMPLES];
+  const char *name[3] = {"none", "imul", "nop"};
+  for (int k = 0; k < 3; k++) {
+    uint64_t m = 0;
+    for (uint64_t i = 0; i < n; i++) {
+      int kind = !ts_buf[i].seg_id ? 0 : (ts_buf[i].seg_id & 1) ? 1 : 2;
+      if (kind == k)
+        tmp[m++] = ts_buf[i].latency;
+    }
+    if (m) {
+      qsort(tmp, m, sizeof tmp[0], cmp_u64);
+      printf("sibling %-4s: %6lu samples, median latency %lu ticks\n", name[k],
+             m, tmp[m / 2]);
+    }
+  }
+  return csv_ts_write(ts_buf, n, run_stamp) == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -377,55 +335,81 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  int pmc_fd = pmc_open();
-  if (pmc_fd < 0)
-    fprintf(stderr,
-            "note: cannot open %s counter (%s); timing only. Try: sudo, or "
-            "sudo sysctl kernel.perf_event_paranoid=2\n",
-            PMC_NAME, strerror(errno));
-
   time_t now = time(NULL);
   struct tm tm;
   localtime_r(&now, &tm);
   strftime(run_stamp, sizeof run_stamp, "%Y%m%d_%H%M%S", &tm);
-  if (csv_open() != 0)
-    return 1;
 
-  /* 3. SMT sibling control: ./bench [-c CMD] [idle|busy|both]
+  /* 3. SMT sibling control: ./bench [-l] [-c CMD] [idle|busy|both]
    *    (default mode: both). -c CMD: the "busy" sibling runs CMD instead of
    *    the built-in workload (see sibling.h). */
   const char *mode = "both";
   const char *sib_cmd = NULL;
   int opt, bad = 0;
   optind = 1;
-  while ((opt = getopt(argc, argv, "c:h")) != -1) {
+  while ((opt = getopt(argc, argv, "ltc:h")) != -1) {
     if (opt == 'c')
       sib_cmd = optarg;
+    else if (opt == 'l')
+      latency_only = true;
+    else if (opt == 't')
+      time_series = latency_only = true; /* -t implies RDPRU only */
     else
       bad = 1; /* -h or unknown option */
   }
-  if (optind < argc)
+  int mode_given = optind < argc;
+  if (mode_given)
     mode = argv[optind++];
   int want_idle = !strcmp(mode, "idle") || !strcmp(mode, "both");
   int want_busy = !strcmp(mode, "busy") || !strcmp(mode, "both");
+  if (time_series && (sib_cmd || mode_given))
+    bad = 1; /* -t takes no -c and no mode */
   if (bad || optind < argc || (!want_idle && !want_busy)) {
     fprintf(stderr,
-            "usage: %s [-c CMD] [idle|busy|both]\n"
+            "usage: %s [-l] [-c CMD] [idle|busy|both]\n"
+            "       %s -t\n"
+            "  -l      latency mode: RDPRU timing only, do not open the PMC\n"
+            "  -t      time series: probe latency over a window while the sibling\n"
+            "          alternates imul / nop segments -> odata/ts/*.csv (implies -l,\n"
+            "          no -c, no mode)\n"
             "  -c CMD  run CMD (via sh -c) on the SMT sibling during the busy\n"
             "          sweep instead of the built-in workload; it must keep\n"
             "          running; output is discarded\n",
-            argv[0]);
+            argv[0], argv[0]);
     return 1;
   }
+
+  /* Open the PMC counter, for reading `IntSch1TokenStall` events. Skipped in
+   * latency mode (-l): only the RDPRU timer is used, no perf_event_open. */
+  int pmc_fd = -1;
+  if (latency_only) {
+    printf("latency mode: RDPRU timing only, PMC %s not opened\n", PMC_NAME);
+  } else {
+    pmc_fd = pmc_open();
+    if (pmc_fd < 0)
+      fprintf(stderr,
+              "note: cannot open %s counter (%s); timing only. Try: sudo, or "
+              "sudo sysctl kernel.perf_event_paranoid=2\n",
+              PMC_NAME, strerror(errno));
+  }
+
+  if (time_series)
+    return run_timeseries();
+  if (csv_open(run_stamp, cpu_model) != 0)
+    return 1;
+
   if (sib_cmd && !want_busy)
     fprintf(stderr, "note: -c is ignored, mode '%s' has no busy sweep\n", mode);
   sibling_set_command(sib_cmd);
   int sib = sibling_start(CPU_ID);
   if (sib == SIBLING_ERROR) {
-    fprintf(stderr, "cannot control the SMT sibling of CPU %d: aborting "
-                    "(results would not be valid)\n", CPU_ID);
+    fprintf(stderr,
+            "cannot control the SMT sibling of CPU %d: aborting "
+            "(results would not be valid)\n",
+            CPU_ID);
     return 1;
   }
+
   if (sib < 0) {
     printf("no SMT sibling found for CPU %d: sibling mode ignored%s\n", CPU_ID,
            sib_cmd ? " (and so is -c)" : "");
@@ -441,7 +425,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot start the busy sibling load: aborting\n");
         sibling_kill_command();
         sibling_stop();
-        fclose(csv_file);
+        csv_close();
         return 1;
       }
       if (sib_cmd)
@@ -456,8 +440,9 @@ int main(int argc, char **argv) {
     sibling_kill_command();
     sibling_stop();
   }
+
   if (pmc_fd >= 0)
     close(pmc_fd);
-  fclose(csv_file);
+  csv_close();
   return 0;
 }
